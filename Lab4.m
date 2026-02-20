@@ -49,24 +49,26 @@ BLENDER.ballYaw   = 0;
 defaults.Ztrue_m = 3.0;
 
 % use f_px directly (pixels) and baseline B (meters)
-defaults.f_px = 800;     % focal length in pixels (set to match your Blender camera intrinsics)
-defaults.B_m  = 0.10;    % baseline in meters (camera separation)
+defaults.f_px = 2632;     % focal length in pixels (set to match your Blender camera intrinsics)
+defaults.B_m  = 0.10;     % baseline in meters (camera separation)
+defaults.camZ = 10.0;     % Blender camera world Z (matches CamL/CamR z used for rendering)
+defaults.Zoffset = 0.25;  % Ball is set to z = Ztrue - Zoffset in Blender (matches your server move)
 
 % principal point defaults (auto set to image center on render)
-defaults.cx   = 376;     % will be overwritten by actual image width/2
-defaults.cy   = 240;     % overwritten by image height/2
+defaults.cx   = 376;      % overwritten by actual image width/2
+defaults.cy   = 240;      % overwritten by actual image height/2
 
 % detection defaults
 defaults.method = "GrayThresh";   % GrayThresh | YCbCrNeutral | Circles
-defaults.grayThresh = 0.00;       % for GrayThresh (0 = auto/Otsu)
-defaults.minBlobArea = 800;
+defaults.grayThresh = 0.00;        % for GrayThresh (0 = auto/Otsu)
+defaults.minBlobArea = 100;
 defaults.maxBlobArea = 2e4;
 
 % YCbCr neutral thresholds
-defaults.yMin = 0.45;            % brightness threshold for YCbCr (0..1)
-defaults.tCbCr = 0.15;           % tolerance around neutral chroma (0..0.5)
+defaults.yMin = 0.45;      % brightness threshold for YCbCr (0..1)
+defaults.tCbCr = 0.15;     % tolerance around neutral chroma (0..0.5)
 
-defaults.useTopCrop = false;      % optional: crop to top fraction
+defaults.useTopCrop = false;  % optional: crop to top fraction
 defaults.topFrac    = 0.75;
 
 % overlay
@@ -74,26 +76,22 @@ defaults.overlayRadiusPx = 16;
 
 %% -------------------- GUI SETUP --------------------
 ui = uifigure('Name','Lab 4 - Stereo Ball Localization (Blender)','Position',[100 100 1200 700]);
+ui.CloseRequestFcn = @(~,~) onClose();
 
 client = [];
 
 busy = false;                 % prevents overlapping Blender calls
+pendingUpdate = false;        % UI changed while busy -> run one more update
+
+% Keep last-good centroids to stabilize tracking and prevent L/R flips
+lastCL = [];
+lastCR = [];
+
 autoTimer = timer( ...
     'ExecutionMode','singleShot', ...
     'StartDelay', 0.15, ...    % debounce delay (seconds)
     'TimerFcn', @(~,~) safeUpdateOnce() ); %#ok<NASGU>
 
-ui.CloseRequestFcn = @(~,~) onClose();
-
-function onClose()
-    try
-        if ~isempty(client) && isvalid(client)
-            clear client;
-        end
-    catch
-    end
-    delete(ui);
-end
 
 main = uigridlayout(ui,[3 3]);
 main.ColumnWidth = {430,'1x','1x'};
@@ -117,7 +115,7 @@ axis(axR,'image'); axis(axR,'off');
 
 % 3D plot panel
 p3 = uipanel(main,'Title','3D Ball Position');
-p3.Layout.Row = [2 3]; 
+p3.Layout.Row = [2 3];
 p3.Layout.Column = [2 3];
 
 g3 = uigridlayout(p3,[1 1]);
@@ -126,6 +124,9 @@ ax3 = uiaxes(g3);
 grid(ax3,'on'); view(ax3,3);
 xlabel(ax3,'X (m)'); ylabel(ax3,'Y (m)'); zlabel(ax3,'Z (m)');
 title(ax3,'3D Ball Position');
+
+% Persistent 3D point handle (IMPORTANT: prevents "stale point" when we skip updates)
+hPt3 = plot3(ax3, NaN, NaN, NaN, 'ro', 'MarkerSize', 10, 'LineWidth', 2);
 
 % Controls (top-left)
 pCtrl = uipanel(main,'Title','Controls');
@@ -142,56 +143,69 @@ g.ColumnSpacing = 8;
 % Row 1: Ztrue (meters)
 uilabel(g,'Text','Z true (m)');
 sZ = uislider(g,'Limits',[3 5],'Value',defaults.Ztrue_m);
+        sZ.ValueChangedFcn = @(src,~) onZSlider(src);
 sZ.Layout.Row = 1; sZ.Layout.Column = 2;
 eZ = uieditfield(g,'numeric','Value',defaults.Ztrue_m);
+        eZ.ValueChangedFcn = @(src,~) onEditZ(src);
 eZ.Layout.Row = 1; eZ.Layout.Column = 3;
 
 % Row 2: method
 uilabel(g,'Text','Detection method');
 ddMethod = uidropdown(g,'Items',["GrayThresh","YCbCrNeutral","Circles"],'Value',defaults.method);
+        ddMethod.ValueChangedFcn = @(~,~) onParamChange();
 ddMethod.Layout.Row = 2; ddMethod.Layout.Column = [2 3];
 
 % Row 3: f_px
 uilabel(g,'Text','f (pixels)');
 eF = uieditfield(g,'numeric','Value',defaults.f_px);
+        eF.ValueChangedFcn = @(~,~) onParamChange();
 eF.Layout.Row = 3; eF.Layout.Column = [2 3];
 
 % Row 4: baseline B
 uilabel(g,'Text','Baseline B (m)');
 eB = uieditfield(g,'numeric','Value',defaults.B_m);
+        eB.ValueChangedFcn = @(~,~) onParamChange();
 eB.Layout.Row = 4; eB.Layout.Column = [2 3];
 
 % Row 5: gray thresh
 uilabel(g,'Text','Gray thresh (0..1)');
 sGray = uislider(g,'Limits',[0 1],'Value',defaults.grayThresh);
+        sGray.ValueChangedFcn = @(src,~) onGraySlider(src);
 sGray.Layout.Row = 5; sGray.Layout.Column = 2;
 eGray = uieditfield(g,'numeric','Value',defaults.grayThresh,'Limits',[0 1]);
+        eGray.ValueChangedFcn = @(src,~) onGrayEdit(src);
 eGray.Layout.Row = 5; eGray.Layout.Column = 3;
 
 % Row 6: min blob area
 uilabel(g,'Text','Min blob area');
 eMinA = uieditfield(g,'numeric','Value',defaults.minBlobArea);
+        eMinA.ValueChangedFcn = @(~,~) onParamChange();
 eMinA.Layout.Row = 6; eMinA.Layout.Column = [2 3];
 
 % Row 7: max blob area
 uilabel(g,'Text','Max blob area');
 eMaxA = uieditfield(g,'numeric','Value',defaults.maxBlobArea);
+        eMaxA.ValueChangedFcn = @(~,~) onParamChange();
 eMaxA.Layout.Row = 7; eMaxA.Layout.Column = [2 3];
 
 % Row 8: YCbCr brightness min (only used for YCbCrNeutral)
 uilabel(g,'Text','YCbCr: Y min (0=auto)');
 eYmin = uieditfield(g,'numeric','Value',0,'Limits',[0 1]);  % Value=0 means AUTO
+        eYmin.ValueChangedFcn = @(~,~) onParamChange();
 eYmin.Layout.Row = 8; eYmin.Layout.Column = [2 3];
 
 % Row 9: YCbCr chroma tolerance (only used for YCbCrNeutral)
 uilabel(g,'Text','YCbCr: chroma tol');
 eTcbcr = uieditfield(g,'numeric','Value',defaults.tCbCr,'Limits',[0 0.5]);
+        eTcbcr.ValueChangedFcn = @(~,~) onParamChange();
 eTcbcr.Layout.Row = 9; eTcbcr.Layout.Column = [2 3];
 
 % Row 10: top crop checkbox + frac
 cbTop = uicheckbox(g,'Text','Search only top of image','Value',defaults.useTopCrop);
+        cbTop.ValueChangedFcn = @(~,~) onParamChange();
 cbTop.Layout.Row = 10; cbTop.Layout.Column = [1 2];
 eTopFrac = uieditfield(g,'numeric','Value',defaults.topFrac,'Limits',[0.1 1]);
+        eTopFrac.ValueChangedFcn = @(~,~) onParamChange();
 eTopFrac.Layout.Row = 10; eTopFrac.Layout.Column = 3;
 
 % Output panel (bottom-left)
@@ -204,7 +218,7 @@ go.RowHeight = {40,24,24,24,24,24,24,'1x'};
 go.Padding = [10 10 10 10];
 go.RowSpacing = 8;
 
-btnCalc = uibutton(go,'Text','Calculate','ButtonPushedFcn',@(~,~)updateOnce());
+btnCalc = uibutton(go,'Text','Calculate','ButtonPushedFcn',@(~,~) safeUpdateOnce());
 btnCalc.Layout.Row = 1;
 
 lblL = uilabel(go,'Text','Left centroid (u,v): --');  lblL.Layout.Row = 2;
@@ -219,11 +233,9 @@ msg.Layout.Row = 8;
 
 % Bindings between slider and edit box (Ztrue)
 sZ.ValueChangingFcn = @(src,evt)set(eZ,'Value',evt.Value);
-eZ.ValueChangedFcn  = @(src,evt)set(sZ,'Value',src.Value);
 
 % Gray thresh link
 sGray.ValueChangingFcn = @(src,evt)set(eGray,'Value',evt.Value);
-eGray.ValueChangedFcn  = @(src,evt)set(sGray,'Value',src.Value);
 
 %% -------------------- TCP CLIENT STATE --------------------
 client = [];
@@ -232,6 +244,7 @@ client = [];
     function updateOnce()
         % Prevent overlapping calls (overlap can corrupt TCP stream and crash the Blender timer)
         if busy
+            pendingUpdate = true;
             return;
         end
         busy = true;
@@ -286,8 +299,10 @@ client = [];
         end
 
         if isempty(IL) || isempty(IR)
-            % show blank axes
-            cla(axL); cla(axR); cla(ax3);
+            % show blank axes and CLEAR 3D point
+            cla(axL); cla(axR);
+            hPt3.XData = NaN; hPt3.YData = NaN; hPt3.ZData = NaN;
+
             lblL.Text = "Left centroid (u,v): --";
             lblR.Text = "Right centroid (u,v): --";
             lblD.Text = "Disparity d (px): --";
@@ -305,10 +320,17 @@ client = [];
         title(axR, sprintf("Right (Z=%.1fm)", Ztrue));
 
         % ---- Stage 2: Detect centroids ----
-        [cL, dbgL] = detectBallCentroid(IL, params);
-        [cR, dbgR] = detectBallCentroid(IR, params);
+        paramsL = params; paramsR = params;
+        paramsL.refCentroid = lastCL;
+        paramsR.refCentroid = lastCR;
+
+        [cL, dbgL] = detectBallCentroid(IL, paramsL);
+        [cR, dbgR] = detectBallCentroid(IR, paramsR);
 
         if any(isnan(cL)) || any(isnan(cR))
+            % IMPORTANT: clear 3D point when we skip update
+            hPt3.XData = NaN; hPt3.YData = NaN; hPt3.ZData = NaN;
+
             msg.Value = [
                 infoLines(:)
                 "Centroid detection failed."
@@ -320,6 +342,10 @@ client = [];
 
             return;
         end
+
+        % update last-good centroids (stabilizes tracking and helps Circles choice)
+        lastCL = cL;
+        lastCR = cR;
 
         % overlay centroid markers (point + circle so it's obvious)
         rPx = max(6, round(params.overlayRadiusPx));
@@ -340,8 +366,11 @@ client = [];
         % principal point from image center
         w = size(IL,2);
         h = size(IL,1);
-        cx = w/2;
-        cy = h/2;
+        shift_x = 0.25;
+        shift_y = 0.0;
+
+        cx = w/2  - shift_x * w;
+        cy = h/2 + shift_y * h;
 
         f = params.f_px;
         B = params.B_m;
@@ -349,11 +378,15 @@ client = [];
         d = (cL(1) - cR(1)); % disparity in pixels
         lblD.Text = sprintf("Disparity d (px): %.2f", d);
 
-        if abs(d) < 1e-6
-            msg.Value = [
-                infoLines
-                "Disparity ~ 0 -> cannot triangulate (infinite Z)."
-            ];
+        % Disparity sanity checks (stereo depth becomes unstable when |d| is small)
+        if ~isfinite(d) || abs(d) < 1.0
+            hPt3.XData = NaN; hPt3.YData = NaN; hPt3.ZData = NaN;
+            msg.Value = [infoLines; "Disparity too small (< 1 px) -> depth unstable. Skipping update."];
+            return;
+        end
+        if d < 0
+            hPt3.XData = NaN; hPt3.YData = NaN; hPt3.ZData = NaN;
+            msg.Value = [infoLines; "Negative disparity (uL < uR) -> wrong match or swapped L/R. Skipping update."];
             return;
         end
 
@@ -363,22 +396,28 @@ client = [];
 
         lblX.Text = sprintf("X (m): %.3f", X);
         lblY.Text = sprintf("Y (m): %.3f", Y);
-        lblZ.Text = sprintf("Z (m): %.3f", Z);
 
-        % plot in 3D
-        cla(ax3);
-        plot3(ax3, X, Y, Z, 'ro','MarkerSize',10,'LineWidth',2);
-        grid(ax3,'on'); view(ax3,3);
-        xlabel(ax3,'X (m)'); ylabel(ax3,'Y (m)'); zlabel(ax3,'Z (m)');
-        title(ax3,'3D Ball Position');
-        
+        % Z from triangulation is *depth from the camera plane* (assuming parallel stereo).
+        % In Blender, cameras are at z=camZ and the ball world z is (Ztrue - Zoffset),
+        % so a 'world Z' estimate is: ballZ_est = camZ - Zdepth, and Ztrue_est = ballZ_est + Zoffset.
+        Zdepth = Z;
+        ballZ_est  = params.camZ - Zdepth;          % estimated Blender world z of the ball
+        Ztrue_est  = ballZ_est + params.Zoffset;    % estimated value matching the Ztrue slider
+
+        lblZ.Text = sprintf("Zdepth (m): %.3f   |   Ztrue est (m): %.3f", Zdepth, Ztrue_est);
+
+        % --- Update 3D point (DO NOT cla(ax3); otherwise skipped updates leave stale point) ---
+        hPt3.XData = X;
+        hPt3.YData = Y;
+        hPt3.ZData = Z;
+
         % Auto limits so the ball is always visible
         padXY = 0.25;              % meters
         padZ  = max(0.5, 0.2*Z);   % scale with distance
-        
-        xlim(ax3, [X - padXY, X + padXY]);
-        ylim(ax3, [Y - padXY, Y + padXY]);
-        zlim(ax3, [max(0, Z - padZ), Z + padZ]);
+
+        xlim(ax3, sort([X - padXY, X + padXY]));
+        ylim(ax3, sort([Y - padXY, Y + padXY]));
+        zlim(ax3, sort([max(0, Z - padZ), Z + padZ]));
 
         msg.Value = [
             infoLines
@@ -392,6 +431,84 @@ client = [];
         if isvalid(btnCalc)
             btnCalc.Enable = 'on';
         end
+        if pendingUpdate
+            pendingUpdate = false;
+            % run one more update with latest UI values (debounced-safe)
+            scheduleUpdate();
+        end
+    end
+
+%% -------------------- DEBOUNCE / UI HELPERS --------------------
+    function onParamChange()
+        scheduleUpdate();
+    end
+
+    function onEditZ(src)
+        % Keep Z slider in sync with numeric edit, then debounce update
+        try
+            set(sZ,'Value',src.Value);
+        catch
+        end
+        scheduleUpdate();
+    end
+
+    function onGraySlider(src)
+        % Keep gray edit in sync with slider, then debounce update
+        try
+            set(eGray,'Value',src.Value);
+        catch
+        end
+        scheduleUpdate();
+    end
+
+    function onGrayEdit(src)
+        % Keep gray slider in sync with numeric edit, then debounce update
+        try
+            set(sGray,'Value',src.Value);
+        catch
+        end
+        scheduleUpdate();
+    end
+
+    function onZSlider(src)
+        % Keep Z edit in sync with slider, then debounce update
+        try
+            set(eZ,'Value',src.Value);
+        catch
+        end
+        scheduleUpdate();
+    end
+
+    function scheduleUpdate()
+        % Debounce: restart the single-shot timer so rapid changes coalesce
+        try
+            if ~isempty(autoTimer) && isvalid(autoTimer)
+                stop(autoTimer);
+                start(autoTimer);
+            else
+                safeUpdateOnce();
+            end
+        catch
+            safeUpdateOnce();
+        end
+    end
+
+    function onClose()
+        % Stop timer, close TCP client, then close UI
+        try
+            if ~isempty(autoTimer) && isvalid(autoTimer)
+                stop(autoTimer);
+                delete(autoTimer);
+            end
+        catch
+        end
+        try
+            if ~isempty(client) && isvalid(client)
+                clear client; % closes tcpclient
+            end
+        catch
+        end
+        delete(ui);
     end
 
 %% -------------------- BLENDER I/O --------------------
@@ -417,6 +534,39 @@ client = [];
         % Lock the current client for this whole request
         c = client;
 
+        % Discard any stale bytes left in the TCP buffer (prevents stream desync)
+        flushClient(c);
+
+        % Local helper: retry once on timeout by dropping/recreating the socket
+        function out = blenderLinkRetry(varargin)
+            try
+                out = blenderLink(varargin{:});
+            catch ME
+                isTimeout = contains(ME.message,"Timeout","IgnoreCase",true) || contains(ME.message,"timed out","IgnoreCase",true);
+                isReadErr = contains(ME.message,"read","IgnoreCase",true) || contains(ME.message,"connection","IgnoreCase",true);
+                if isTimeout || isReadErr
+                    try, clear client; catch, end
+                    if ~ensureClient()
+                        rethrow(ME);
+                    end
+                    varargin{1} = client;
+                    out = blenderLink(varargin{:});
+                else
+                    rethrow(ME);
+                end
+            end
+        end
+
+        function flushClient(c2)
+            try
+                n = c2.NumBytesAvailable;
+                if n > 0
+                    read(c2, n, "uint8");
+                end
+            catch
+            end
+        end
+
         % Define camera translations (centered baseline)
         B = params.B_m;
         camXL = -B/2;
@@ -439,7 +589,7 @@ client = [];
             disp("STEP 1/3: move ball");
             drawnow;
 
-            blenderLink(c, BLENDER.width, BLENDER.height, ...
+            blenderLinkRetry(c, BLENDER.width, BLENDER.height, ...
                 0, 0, zBall, ...
                 BLENDER.ballPitch, BLENDER.ballRoll, BLENDER.ballYaw, ...
                 BLENDER.ballName);
@@ -463,7 +613,7 @@ client = [];
             disp("STEP 2/3: render LEFT");
             drawnow;
 
-            IL = blenderLink(c, BLENDER.width, BLENDER.height, ...
+            IL = blenderLinkRetry(c, BLENDER.width, BLENDER.height, ...
                 BLENDER.camBaseX+camXL, BLENDER.camBaseY, BLENDER.camBaseZ, ...
                 BLENDER.camPitch, BLENDER.camRoll, BLENDER.camYaw, ...
                 BLENDER.cameraName);
@@ -487,7 +637,7 @@ client = [];
             disp("STEP 3/3: render RIGHT");
             drawnow;
 
-            IR = blenderLink(c, BLENDER.width, BLENDER.height, ...
+            IR = blenderLinkRetry(c, BLENDER.width, BLENDER.height, ...
                 BLENDER.camBaseX+camXR, BLENDER.camBaseY, BLENDER.camBaseZ, ...
                 BLENDER.camPitch, BLENDER.camRoll, BLENDER.camYaw, ...
                 BLENDER.cameraName);
@@ -534,49 +684,125 @@ client = [];
 
         switch method
             case "GrayThresh"
-                Ig = rgb2gray(Iwork);
-                Igd = im2double(Ig);
-
-                if params.grayThresh <= 0
-                    % Auto threshold (Otsu). Works well across different lighting/exposure.
-                    t = graythresh(Ig);
-                else
-                    t = params.grayThresh;
-                end
-
-                BW = Igd > t;
-                dbg(end+1) = sprintf("GrayThresh: t=%.3f  Ig[min,max]=[%.3f, %.3f]", t, min(Igd(:)), max(Igd(:)));
-
+            Ig = im2double(rgb2gray(Iwork));
+        
+            % Detect the DARK pupil (black circle) instead of bright court lines
+            % (Use adaptive or Otsu on inverted image)
+            Iinv = 1 - Ig;
+        
+            if params.grayThresh > 0
+                t = params.grayThresh;
+                BW = Iinv > t;
+                tUsed = t;
+                tType = "manual(inv)";
+            else
+                tUsed = graythresh(Iinv);      % Otsu on inverted
+                BW = imbinarize(Iinv, tUsed);
+                tType = "otsu(inv)";
+            end
+        
+            % Clean up and fill
+            BW = bwareaopen(BW, 50);          % remove tiny specks
+            BW = imclose(BW, strel('disk', 3));
+            BW = imfill(BW, 'holes');
+        
+            % --- area limits: if yours are too strict, auto widen for this method ---
+            minA = params.minBlobArea;
+            maxA = params.maxBlobArea;
+        
+            % For the pupil, the blob is smaller than the full ball, so relax defaults
+            if isempty(minA) || minA > 2000, minA = 80;  end
+            if isempty(maxA) || maxA < 3000, maxA = 8000; end
+        
+            CC = bwconncomp(BW);
+            stats = regionprops(CC,'Area','Centroid','Eccentricity');
+        
+            if isempty(stats)
+                dbg = [
+                    "GrayThresh(dark pupil): no components."
+                    sprintf("t=%s %.3f", tType, tUsed)
+                ];
+                centroid = [NaN NaN];
+                return;
+            end
+        
+            A  = [stats.Area];
+            E  = [stats.Eccentricity];
+        
+            ok = (A >= minA) & (A <= maxA) & (E <= 0.85);  % prefer round-ish blobs
+        
+            if ~any(ok)
+                dbg = [
+                    "GrayThresh(dark pupil): no blobs after area/ecc filter."
+                    sprintf("t=%s %.3f  areas=[%.0f..%.0f]  kept=0/%d", tType, tUsed, min(A), max(A), numel(A))
+                    sprintf("minA=%.0f maxA=%.0f", minA, maxA)
+                ];
+                centroid = [NaN NaN];
+                return;
+            end
+        
+            % If you have a refCentroid (last good), pick closest; else pick largest
+            candIdx = find(ok);
+            centCand = reshape([stats(candIdx).Centroid],2,[])';
+            areaCand = A(candIdx);
+        
+            if isfield(params,'refCentroid') && ~isempty(params.refCentroid)
+                d2 = sum((centCand - params.refCentroid(:).').^2, 2);
+                [~,k] = min(d2);
+            else
+                [~,k] = max(areaCand);
+            end
+        
+            centroid = centCand(k,:);
+        
+            dbg = [
+                sprintf("GrayThresh: %s t=%.3f (dark pupil)", tType, tUsed)
+                sprintf("Components=%d, kept=%d, chosenArea=%.0f", numel(A), numel(candIdx), areaCand(k))
+            ];
+            return;
             case "YCbCrNeutral"
                 YCbCr = rgb2ycbcr(Iwork);
                 Cb = im2double(YCbCr(:,:,2));
                 Cr = im2double(YCbCr(:,:,3));
                 Y  = im2double(YCbCr(:,:,1));
-            
+
                 t = params.tCbCr;
-            
+
                 % AUTO brightness threshold if yMin <= 0
                 if params.yMin <= 0
                     yMin = prctile(Y(:), 97);      % focuses on brightest stuff (ball highlight)
                 else
                     yMin = params.yMin;
                 end
-            
+
                 BW = (abs(Cb - 0.5) < t) & (abs(Cr - 0.5) < t) & (Y > yMin);
-            
+
                 dbg(end+1) = sprintf("YCbCr: yMin=%.3f t=%.2f  Y[min,max]=[%.2f,%.2f]", ...
                                      yMin, t, min(Y(:)), max(Y(:)));
 
             case "Circles"
                 Ig = rgb2gray(Iwork);
-                % Hough circle search (tune these if needed)
-                [centers, radii] = imfindcircles(Ig,[10 200],'ObjectPolarity','bright','Sensitivity',0.92); %#ok<ASGLU>
+
+                % Narrower radius range + metric output improves stability
+                % (tune [18 70] if your rendered ball appears bigger/smaller)
+                [centers, radii, metric] = imfindcircles(Ig,[18 70], ...
+                    'ObjectPolarity','bright','Sensitivity',0.95,'EdgeThreshold',0.10); %#ok<ASGLU>
+
                 if isempty(centers)
                     dbg = ["imfindcircles found nothing."];
                     return;
                 end
-                % take strongest circle
-                centroid = centers(1,:);
+
+                % Pick circle closest to previous centroid (prevents L/R flip and jitter)
+                if isfield(params,'refCentroid') && ~isempty(params.refCentroid) && size(centers,1) > 1
+                    d2 = sum((centers - params.refCentroid(:).').^2, 2);
+                    [~,k] = min(d2);
+                else
+                    [~,k] = max(metric);
+                end
+
+                centroid = centers(k,:);
+                dbg(end+1) = sprintf("Circles: picked r=%.1f metric=%.3f", radii(k), metric(k));
                 return;
 
             otherwise
@@ -587,9 +813,20 @@ client = [];
         % quick sanity info
         dbg(end+1) = sprintf("BW white pixels = %d", nnz(BW));
 
-        % blob filter
+        % blob filter + shape scoring (more robust when court lines also threshold)
+        % 1) Remove tiny specks
         BW = bwareaopen(BW, max(1, round(params.minBlobArea)));
-        stats = regionprops(BW,'Area','Centroid');
+
+        % 2) Morphology to suppress thin lines and consolidate the ball region
+        try
+            BW = imopen(BW, strel('disk', 2));     % removes thin structures (court lines)
+            BW = imclose(BW, strel('disk', 3));    % closes small gaps on the ball edge
+            BW = imfill(BW, 'holes');              % fill donut-like ball regions
+        catch
+        end
+
+        % 3) Score connected components by "ball-likeness"
+        stats = regionprops(BW,'Area','Centroid','Perimeter','Eccentricity','Solidity');
 
         if isempty(stats)
             dbg(end+1) = "No blobs after threshold/area filter.";
@@ -597,17 +834,62 @@ client = [];
         end
 
         areas = [stats.Area];
-        ok = (areas >= params.minBlobArea) & (areas <= params.maxBlobArea);
 
-        stats = stats(ok);
-        if isempty(stats)
-            dbg(end+1) = "Blobs found, but none within [min,max] area.";
-            return;
+        % User area constraints (if provided)
+        minA = max(1, params.minBlobArea);
+        maxA = params.maxBlobArea;
+
+        % If maxBlobArea is not sensible, set a generous default relative to image size
+        if isempty(maxA) || ~isfinite(maxA) || maxA <= 0
+            maxA = 0.25 * numel(BW);  % up to 25% of image
         end
 
-        % choose largest remaining blob
-        [~,k] = max([stats.Area]);
-        c = stats(k).Centroid;
+        okA = (areas >= minA) & (areas <= maxA);
+        statsA = stats(okA);
+
+        if isempty(statsA)
+            dbg(end+1) = "Blobs found, but none within [min,max] area.";
+            % fall back: keep all and let shape score decide
+            statsA = stats;
+        end
+
+        % Compute circularity (1 = perfect circle). Protect from divide-by-zero.
+        per = [statsA.Perimeter];
+        circ = 4*pi*[statsA.Area] ./ max(per.^2, eps);
+
+        ecc  = [statsA.Eccentricity];
+        sol  = [statsA.Solidity];
+
+        % Shape filter: ball should be fairly round + solid
+        okShape = (circ >= 0.35) & (ecc <= 0.92) & (sol >= 0.75);
+
+        if any(okShape)
+            statsB = statsA(okShape);
+            per = [statsB.Perimeter];
+            circ = 4*pi*[statsB.Area] ./ max(per.^2, eps);
+        else
+            statsB = statsA; % no shape match; pick best by score anyway
+        end
+
+        % Score: prioritize circularity, then area (avoid picking long lines)
+        score = circ .* sqrt([statsB.Area]);
+
+        % Prefer the blob closest to the previous centroid (stabilizes tracking), if available
+        if isfield(params,'refCentroid') && ~isempty(params.refCentroid) && numel(statsB) > 1
+            C = reshape([statsB.Centroid], 2, []).';   % Nx2
+            d2 = sum((C - params.refCentroid(:).').^2, 2);
+            % combine shape score with proximity (normalize both)
+            s1 = score(:) / max(score(:));
+            s2 = 1 ./ (1 + d2);                         % higher is closer
+            comb = 0.75*s1 + 0.25*s2;
+            [~,k] = max(comb);
+        else
+            [~,k] = max(score);
+        end
+        c = statsB(k).Centroid;
+
+        dbg(end+1) = sprintf("Blob pick: area=%d  circ=%.2f  ecc=%.2f  sol=%.2f", ...
+                             round(statsB(k).Area), circ(k), statsB(k).Eccentricity, statsB(k).Solidity);
 
         centroid = [c(1), c(2)];
     end
@@ -633,7 +915,6 @@ client = [];
     end
 
     function safeUpdateOnce()
-        % (Optional) helper for debounced updates if you later want auto-updating controls
         try
             updateOnce();
         catch ME
